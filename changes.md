@@ -196,6 +196,8 @@ DATA=/path/to/plantnet_300K BACKBONE=dinov2_l14 bash sh/plantnet.sh
 DATA=/path/to/plantnet_300K BACKBONE=clip_b32   bash sh/plantnet.sh
 ```
 
+**On a free Kaggle GPU:** see [KAGGLE.md](KAGGLE.md). A ready-made notebook (`kaggle/LTIC_PlantNet_Kaggle.ipynb`) runs all of the above in one go on 2× T4 GPUs.
+
 **Reproducing the paper:**
 - `sh/R50.sh` still runs the original setup: CLIP ViT-B/32, Herbarium colour normalization, and the original class-group boundaries.
 - Two small differences remain:

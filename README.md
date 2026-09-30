@@ -76,6 +76,8 @@ DATA=/path/to/plantnet_300K bash sh/plantnet_eval.sh
 DATA=/path/to/plantnet_300K BACKBONE=dinov2_l14 bash sh/plantnet.sh
 ```
 
+To run on a free Kaggle GPU instead, follow [KAGGLE.md](KAGGLE.md) (notebook: `kaggle/LTIC_PlantNet_Kaggle.ipynb`).
+
 Pl@ntNet images are field photos, so `presizer.py` (which trims herbarium sheet borders) is not needed. Besides top-1/top-5, the log reports `MacroAcc`, the mean per-class accuracy used by the Pl@ntNet-300K benchmark.
 
 ## Citation
