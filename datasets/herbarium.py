@@ -8,12 +8,12 @@ from PIL import Image
 import random
 
 class LT_Dataset(Dataset):
-    num_classes=15505
-    def __init__(self, root, txt, transform=None, class_balance=False):
+    def __init__(self, root, txt, transform=None, class_balance=False, num_classes=15505):
         self.img_path = []
         self.labels = []
         self.transform = transform
         self.class_balance=class_balance
+        self.num_classes=num_classes
         with open(txt) as f:
             for line in f:
                 self.img_path.append(os.path.join(root, line.split()[0]))
@@ -72,8 +72,17 @@ class LT_Dataset_Test(Dataset):
         return sample, label 
 
 class herbariumDataset(object):
-    def __init__(self, batch_size=32, root="/media/intisar/dataset1/visual_categorization/herbarium-2022-fgvc9/", class_balance=False, num_works=12):
-        normalize = transforms.Normalize(mean=[0.466, 0.471, 0.380], std=[0.195, 0.194, 0.192])
+    num_classes = 15505
+    train_file = "train_hbm.txt"
+    val_file = "val_hbm.txt"
+    mean = [0.466, 0.471, 0.380]
+    std = [0.195, 0.194, 0.192]
+
+    def __init__(self, batch_size=32, root="/media/intisar/dataset1/visual_categorization/herbarium-2022-fgvc9/", class_balance=False, num_works=12,
+                 train_txt=None, val_txt=None, num_classes=None, mean=None, std=None):
+        # mean/std default to the dataset statistics; pass the encoder's to match its pretraining
+        normalize = transforms.Normalize(mean=mean or self.mean, std=std or self.std)
+        self.num_classes = num_classes or self.num_classes
 
         transform_train=transforms.Compose([
             transforms.RandomResizedCrop(224),
@@ -88,10 +97,17 @@ class herbariumDataset(object):
                 transforms.ToTensor(),
                 normalize,
             ])
-        train_txt="/media/intisar/dataset1/visual_categorization/herbarium-2022-fgvc9/train_hbm.txt"
-        val_txt="/media/intisar/dataset1/visual_categorization/herbarium-2022-fgvc9/val_hbm.txt"
-        trainset = LT_Dataset(root, train_txt, transform=transform_train, class_balance=class_balance)
-        testset = LT_Dataset_Test(root, val_txt, transform=transform_test, class_map=trainset.class_map)
+        self.train_txt = train_txt or os.path.join(root, self.train_file)
+        self.val_txt = val_txt or os.path.join(root, self.val_file)
+        trainset = LT_Dataset(root, self.train_txt, transform=transform_train, class_balance=class_balance, num_classes=self.num_classes)
+        testset = LT_Dataset_Test(root, self.val_txt, transform=transform_test, class_map=trainset.class_map)
+
+        self.trainset = trainset
+        self.testset = testset
+        # Train images per class in label order: labels are sorted by count, rarest class first
+        self.cls_num_list_sorted = sorted(trainset.cls_num_list)
+        self.batch_size = batch_size
+        self.num_works = num_works
 
         self.train = torch.utils.data.DataLoader(
             trainset,

@@ -14,5 +14,10 @@ python CLIP_VIT_LONGTAIL.py \
   --beta 0.85 \
   --gamma 0.3 \
   --after_1x1conv \
-  --num_classes 15505 
+  --num_classes 15505 \
+  --backbone clip_b32 \
+  --dataset_norm \
+  --few_end 6799 \
+  --many_start 13900 \
+  --reslt_split 12568
   

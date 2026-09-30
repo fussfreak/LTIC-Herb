@@ -24,8 +24,9 @@ import torch.nn.functional as F
 
 from datasets import dataset
 from networks import nets
-from networks.clip import CLIP_VIT
-from networks.clip_large_block import CLIP_VIT_Large
+from networks.backbones import BACKBONES
+from networks.ltic import LTICNet
+from utils import feature_cache
 
 
 
@@ -94,12 +95,36 @@ parser.add_argument('--root_path', default="./data", type=str)
 parser.add_argument('--mark', default=None, type=str)
 parser.add_argument('--num_works', default=32, type=int)
 parser.add_argument('--beta', default=None, type=float)
-parser.add_argument('--num_classes', default=15505, type=int)
+parser.add_argument('--num_classes', default=None, type=int,
+                    help='default: the dataset class count (herbarium 15505, plantnet 1081)')
 parser.add_argument('--after_1x1conv', action='store_true')
 parser.add_argument('--gamma', default=0.3, type=float)
 
+# Feature extractor
+parser.add_argument('--backbone', default='bioclip2', choices=sorted(BACKBONES),
+                    help='frozen image encoder (clip_b32 = original LTIC-Herb)')
+parser.add_argument('--dataset_norm', action='store_true',
+                    help='normalize with the dataset mean/std instead of the encoder one (original setup)')
+parser.add_argument('--train_txt', default=None, type=str, help='default: <data_path>/<dataset train file>')
+parser.add_argument('--val_txt', default=None, type=str, help='default: <data_path>/<dataset val file>')
+
+# Many/medium/few-shot class cuts; labels are sorted by train count, rarest first
+parser.add_argument('--many_thr', default=100, type=int, help='many-shot: more train images than this')
+parser.add_argument('--few_thr', default=20, type=int, help='few-shot: fewer train images than this')
+parser.add_argument('--few_end', default=None, type=int, help='override: first label that is not few-shot')
+parser.add_argument('--many_start', default=None, type=int, help='override: first many-shot label')
+parser.add_argument('--reslt_split', default=None, type=int,
+                    help='labels below this train the M branch (default: many_start)')
+
+# Feature cache
+parser.add_argument('--cache_features', action='store_true',
+                    help='extract frozen encoder features once, then train the head on them')
+parser.add_argument('--cache_dir', default='./feat_cache', type=str)
+parser.add_argument('--cache_views', default=5, type=int, help='augmented views cached per train image')
+
 best_acc1 = 0
 args = parser.parse_args()
+args.num_classes = args.num_classes or getattr(dataset, args.dataset).num_classes
 args.root_model = f'{args.root_path}/{args.dataset}/{args.mark}'
 os.makedirs(args.root_model, exist_ok=True)
 
@@ -107,6 +132,29 @@ def crossEntropy(softmax, logit, label, weight, num_classes):
     target = F.one_hot(label, num_classes=num_classes)
     loss = - (weight * (target * torch.log(softmax(logit)+1e-7)).sum(dim=1)).sum()
     return loss
+
+def set_shot_splits(cls_num_list_sorted, args):
+    counts = np.asarray(cls_num_list_sorted)
+    if args.few_end is None:
+        args.few_end = int((counts < args.few_thr).sum())
+    if args.many_start is None:
+        args.many_start = int((counts <= args.many_thr).sum())
+    if args.reslt_split is None:
+        args.reslt_split = args.many_start
+    message = ('=> backbone {} | classes {} | few [0, {}) medium [{}, {}) many [{}, {}) | ResLT M branch [0, {})'
+               .format(args.backbone, len(counts), args.few_end, args.few_end, args.many_start,
+                       args.many_start, len(counts), args.reslt_split))
+    empty = int((counts == 0).sum())
+    if empty:
+        message += '\n=> warning: {} of {} classes have no train images (check --num_classes)'.format(empty, len(counts))
+    print(message)
+    with open(args.root_model + "/train.log", "a+") as f:
+        f.write(message + "\n")
+
+def head_state_dict(model):
+    # The frozen encoder is rebuilt from its pretrained weights, so only the head is saved
+    return {k: v for k, v in model.state_dict().items()
+            if not k.replace('module.', '', 1).startswith('encoder.')}
 
 def main():
 
@@ -163,8 +211,13 @@ def main_worker(gpu, ngpus_per_node, args):
         print("=> using pre-trained model '{}'".format(args.arch))
         model = models.__dict__[args.arch](pretrained=True)
     else:
-        print("=> creating model '{}'".format(args.arch))
-        model = CLIP_VIT_Large(num_classes=args.num_classes, gamma=args.gamma)
+        print("=> creating model '{}' with backbone '{}'".format(args.arch, args.backbone))
+        model = LTICNet(num_classes=args.num_classes, backbone=args.backbone, gamma=args.gamma)
+    encoder = model.encoder
+    if args.gpu is not None:
+        args.device = torch.device('cuda', args.gpu)
+    else:
+        args.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     if args.distributed:
         # For multiprocessing distributed, DistributedDataParallel constructor
         # should always set the single device scope, otherwise,
@@ -192,13 +245,13 @@ def main_worker(gpu, ngpus_per_node, args):
             model.features = torch.nn.DataParallel(model.features)
             model.cuda()
         else:
-            model = torch.nn.DataParallel(model).cuda()
+            model = torch.nn.DataParallel(model).to(args.device)
             filename = args.mark+'_checkpoint.pth.tar'
             if os.path.exists(filename):
                 args.resume = filename
 
     # define loss function (criterion) and optimizer
-    criterion = nn.CrossEntropyLoss().cuda(args.gpu)
+    criterion = nn.CrossEntropyLoss().to(args.device)
 
     optimizer = torch.optim.SGD(model.parameters(), args.lr,
                                 momentum=args.momentum,
@@ -208,18 +261,19 @@ def main_worker(gpu, ngpus_per_node, args):
     if args.resume:
         if os.path.isfile(args.resume):
             print("=> loading checkpoint '{}'".format(args.resume))
-            if args.gpu is None:
-                checkpoint = torch.load(args.resume)
-            else:
-                # Map model to be loaded to specified single gpu.
-                loc = 'cuda:{}'.format(args.gpu)
-                checkpoint = torch.load(args.resume, map_location=loc)
+            # Map model to be loaded to the current device (a specific gpu, or cpu).
+            checkpoint = torch.load(args.resume, map_location=args.device)
             args.start_epoch = checkpoint['epoch']
             best_acc1 = checkpoint['best_acc1']
             if args.gpu is not None:
                 # best_acc1 may be from a checkpoint from a different GPU
                 best_acc1 = best_acc1.to(args.gpu)
-            model.load_state_dict(checkpoint['state_dict'])
+            # Checkpoints hold the head only; the frozen encoder keeps its pretrained weights
+            missing, unexpected = model.load_state_dict(checkpoint['state_dict'], strict=False)
+            missing = [k for k in missing if not k.replace('module.', '', 1).startswith('encoder.')]
+            if missing or unexpected:
+                raise RuntimeError("checkpoint does not match the model: missing {} unexpected {}".format(
+                    missing, unexpected))
             optimizer.load_state_dict(checkpoint['optimizer'])
             print("=> loaded checkpoint '{}' (epoch {})"
                   .format(args.resume, checkpoint['epoch']))
@@ -229,10 +283,17 @@ def main_worker(gpu, ngpus_per_node, args):
     cudnn.benchmark = True
 
     # Data loading code
-    data=getattr(dataset,args.dataset)(root=args.data_path, batch_size=args.batch_size, num_works=args.num_works)
-    train_loader=data.train
-    val_loader=data.test
-   
+    mean, std = (None, None) if args.dataset_norm else (encoder.mean, encoder.std)
+    data=getattr(dataset,args.dataset)(root=args.data_path, batch_size=args.batch_size, num_works=args.num_works,
+                                       train_txt=args.train_txt, val_txt=args.val_txt,
+                                       num_classes=args.num_classes, mean=mean, std=std)
+    set_shot_splits(data.cls_num_list_sorted, args)
+    if args.cache_features:
+        train_loader, val_loader = feature_cache.build_cached_loaders(encoder, data, args)
+    else:
+        train_loader=data.train
+        val_loader=data.test
+
     if args.evaluate:
         validate(val_loader, model, criterion, args)
         return
@@ -257,7 +318,8 @@ def main_worker(gpu, ngpus_per_node, args):
             save_checkpoint({
                 'epoch': epoch + 1,
                 'arch': args.arch,
-                'state_dict': model.state_dict(),
+                'backbone': args.backbone,
+                'state_dict': head_state_dict(model),
                 'best_acc1': best_acc1,
                 'optimizer' : optimizer.state_dict(),
             }, is_best)
@@ -288,15 +350,15 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
         if args.gpu is not None:
             images = images.cuda(args.gpu, non_blocking=True)
 
-        target = target.cuda(args.gpu, non_blocking=True)
+        target = target.to(args.device, non_blocking=True)
 
         # compute output
         bt = images.size(0)
         logitH, logitM, _ = model(images)
 
-        ######## ResLT 
+        ######## ResLT
         labelH=F.one_hot(target, num_classes=args.num_classes).sum(dim=1)
-        labelM=F.one_hot(target, num_classes=args.num_classes)[:,:12568].sum(dim=1)
+        labelM=F.one_hot(target, num_classes=args.num_classes)[:,:args.reslt_split].sum(dim=1)
         I_loss=(crossEntropy(softmax, logitH, target, labelH, args.num_classes) + crossEntropy(softmax, logitM, target, labelM, args.num_classes)) / (labelH.sum() + labelM.sum()) 
     
         logit = logitH + logitM
@@ -336,8 +398,8 @@ def validate(val_loader, model, criterion, args):
 
     # switch to evaluate mode
     model.eval()
-    class_num = torch.zeros(args.num_classes).cuda()
-    correct = torch.zeros(args.num_classes).cuda()
+    class_num = torch.zeros(args.num_classes).to(args.device)
+    correct = torch.zeros(args.num_classes).to(args.device)
 
     all_targets = []
     all_predictions = []
@@ -347,7 +409,7 @@ def validate(val_loader, model, criterion, args):
         for i, (images, target) in enumerate(val_loader):
             if args.gpu is not None:
                 images = images.cuda(args.gpu, non_blocking=True)
-            target = target.cuda(args.gpu, non_blocking=True)
+            target = target.to(args.device, non_blocking=True)
 
             # compute output
             logitH, logitM, _ = model(images)
@@ -388,13 +450,16 @@ def validate(val_loader, model, criterion, args):
         with open(args.root_model + "/train.log", "a+") as f:
             f.write(f'Precision: {precision:.4f}, Recall: {recall:.4f}, F1 Score: {f1:.4f}\n')
             f.write(f'Confusion Matrix:\n{cm}\n')
+        # NaN for classes without validation images; nanmean skips them
         acc_classes = correct / class_num
-        head_acc = acc_classes[13900:].mean()
-        medium_acc = acc_classes[6799:13900].mean()
-        tail_acc = acc_classes[:6799].mean()
-        open(args.root_model + "/train.log", "a+").write(
-            (' * Acc@1 {top1.avg:.3f} Acc@5 {top5.avg:.3f} HAcc {head_acc:.3f} MAcc {medium_acc:.3f} TAcc {tail_acc:.3f} \n').format(
-                top1=top1, top5=top5, head_acc=head_acc, medium_acc=medium_acc, tail_acc=tail_acc))
+        head_acc = acc_classes[args.many_start:].nanmean()
+        medium_acc = acc_classes[args.few_end:args.many_start].nanmean()
+        tail_acc = acc_classes[:args.few_end].nanmean()
+        macro_acc = acc_classes.nanmean()
+        summary = (' * Acc@1 {top1.avg:.3f} Acc@5 {top5.avg:.3f} HAcc {head_acc:.3f} MAcc {medium_acc:.3f} TAcc {tail_acc:.3f} MacroAcc {macro_acc:.3f} \n').format(
+                top1=top1, top5=top5, head_acc=head_acc, medium_acc=medium_acc, tail_acc=tail_acc, macro_acc=macro_acc)
+        print(summary, end='')
+        open(args.root_model + "/train.log", "a+").write(summary)
     return top1.avg
 
 
