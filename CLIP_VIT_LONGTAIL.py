@@ -152,9 +152,10 @@ def set_shot_splits(cls_num_list_sorted, args):
         f.write(message + "\n")
 
 def head_state_dict(model):
-    # The frozen encoder is rebuilt from its pretrained weights, so only the head is saved
-    return {k: v for k, v in model.state_dict().items()
-            if not k.replace('module.', '', 1).startswith('encoder.')}
+    # The frozen encoder is rebuilt from its pretrained weights, so only the head is saved.
+    # Keys carry no 'module.' prefix, so single-GPU and DataParallel runs share checkpoints.
+    return {k: v for k, v in getattr(model, 'module', model).state_dict().items()
+            if not k.startswith('encoder.')}
 
 def main():
 
@@ -244,6 +245,10 @@ def main_worker(gpu, ngpus_per_node, args):
         if args.arch.startswith('alexnet') or args.arch.startswith('vgg'):
             model.features = torch.nn.DataParallel(model.features)
             model.cuda()
+        elif args.cache_features:
+            # Only the small head trains on cached features: DataParallel would copy the whole
+            # frozen encoder to every GPU at every step. Feature extraction still uses all GPUs.
+            model = model.to(args.device)
         else:
             model = torch.nn.DataParallel(model).to(args.device)
             filename = args.mark+'_checkpoint.pth.tar'
@@ -269,8 +274,10 @@ def main_worker(gpu, ngpus_per_node, args):
                 # best_acc1 may be from a checkpoint from a different GPU
                 best_acc1 = best_acc1.to(args.gpu)
             # Checkpoints hold the head only; the frozen encoder keeps its pretrained weights
-            missing, unexpected = model.load_state_dict(checkpoint['state_dict'], strict=False)
-            missing = [k for k in missing if not k.replace('module.', '', 1).startswith('encoder.')]
+            state_dict = {k[len('module.'):] if k.startswith('module.') else k: v
+                          for k, v in checkpoint['state_dict'].items()}
+            missing, unexpected = getattr(model, 'module', model).load_state_dict(state_dict, strict=False)
+            missing = [k for k in missing if not k.startswith('encoder.')]
             if missing or unexpected:
                 raise RuntimeError("checkpoint does not match the model: missing {} unexpected {}".format(
                     missing, unexpected))
@@ -349,8 +356,7 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
         # measure data loading time
         data_time.update(time.time() - end)
 
-        if args.gpu is not None:
-            images = images.cuda(args.gpu, non_blocking=True)
+        images = images.to(args.device, non_blocking=True)
 
         target = target.to(args.device, non_blocking=True)
 
@@ -409,8 +415,7 @@ def validate(val_loader, model, criterion, args):
     with torch.no_grad():
         end = time.time()
         for i, (images, target) in enumerate(val_loader):
-            if args.gpu is not None:
-                images = images.cuda(args.gpu, non_blocking=True)
+            images = images.to(args.device, non_blocking=True)
             target = target.to(args.device, non_blocking=True)
 
             # compute output
